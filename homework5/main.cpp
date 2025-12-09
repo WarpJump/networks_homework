@@ -85,11 +85,11 @@ void setup_keylog() {
 SocketRAII setup_server_socket(int port) {
   SocketRAII server_fd(socket(AF_INET, SOCK_STREAM, 0));
   if (server_fd < 0)
-    error("skill issue on socket creation");
+    error("socket creation failed");
 
   int opt = 1;
   if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)))
-    error("skill issue on setsockopt");
+    error("setsockopt failed");
 
   sockaddr_in address{};
   address.sin_family = AF_INET;
@@ -97,7 +97,7 @@ SocketRAII setup_server_socket(int port) {
   address.sin_port = htons(port);
 
   if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0)
-    error("skill issue on bind");
+    error("bind failed");
   return server_fd;
 }
 
@@ -105,7 +105,7 @@ SocketRAII setup_client_socket(const char *host, int port,
                                sockaddr_in &serv_addr) {
   SocketRAII sock_fd(socket(AF_INET, SOCK_STREAM, 0));
   if (sock_fd < 0)
-    error("skill issue on socket creation");
+    error("socket creation failed");
 
   serv_addr = {};
   serv_addr.sin_family = AF_INET;
@@ -126,6 +126,7 @@ void handle_tcp_client_tls(SocketRAII client_socket, SSL_CTX *ctx) {
   SSL_set_fd(ssl, client_socket);
 
   if (SSL_accept(ssl) <= 0) {
+    ERR_print_errors_fp(stderr);
     return;
   }
   std::cout << "TLS handshake successful." << std::endl;
@@ -136,10 +137,11 @@ void handle_tcp_client_tls(SocketRAII client_socket, SSL_CTX *ctx) {
     if (bytes <= 0) {
       int err = SSL_get_error(ssl, bytes);
       if (err == SSL_ERROR_ZERO_RETURN) {
-        std::cout << "Client disconnected gracefully.\n";
+        std::cout
+            << "Client disconnected gracefully (received close_notify).\n";
       } else {
-        std::cout << "SSL_read failed. Error: " << err << std::endl;
-        ERR_print_errors_fp(stderr);
+        std::cout << "SSL_read failed or conn lost. Error code: " << err
+                  << std::endl;
       }
       break;
     }
@@ -151,11 +153,8 @@ void handle_tcp_client_tls(SocketRAII client_socket, SSL_CTX *ctx) {
     if (!std::getline(std::cin, reply))
       break;
     reply += "\n";
-    if (SSL_write(ssl, reply.c_str(), reply.length()) <= 0) {
-      std::cout << "SSL_write failed.\n";
-      ERR_print_errors_fp(stderr);
+    if (SSL_write(ssl, reply.c_str(), reply.length()) <= 0)
       break;
-    }
   }
   std::cout << "Connection closed. Waiting for new client..." << std::endl;
 }
@@ -165,9 +164,15 @@ void run_tcp_server(int port, const char *cert_path, const char *key_path) {
   if (!ctx)
     error("SSL_CTX_new failed");
 
-  SSL_CTX_use_certificate_file(ctx, cert_path, SSL_FILETYPE_PEM);
+  if (keylog_file)
+    SSL_CTX_set_keylog_callback(ctx, keylog_callback);
 
-  SSL_CTX_use_PrivateKey_file(ctx, key_path, SSL_FILETYPE_PEM);
+  if (SSL_CTX_use_certificate_file(ctx, cert_path, SSL_FILETYPE_PEM) <= 0)
+    error("Failed to load certificate");
+  if (SSL_CTX_use_PrivateKey_file(ctx, key_path, SSL_FILETYPE_PEM) <= 0)
+    error("Failed to load private key");
+  if (!SSL_CTX_check_private_key(ctx))
+    error("Private key does not match certificate");
 
   SocketRAII server_fd = setup_server_socket(port);
   if (listen(server_fd, 5) < 0)
@@ -184,8 +189,18 @@ void run_tcp_server(int port, const char *cert_path, const char *key_path) {
   }
 }
 
-void run_tcp_client(const char *host, int port) {
+void run_tcp_client(const char *host, int port, const char *ca_cert_path) {
   SslCtxRAII ctx(SSL_CTX_new(TLS_client_method()));
+  if (!ctx)
+    error("SSL_CTX_new failed");
+
+  if (keylog_file)
+    SSL_CTX_set_keylog_callback(ctx, keylog_callback);
+
+  if (SSL_CTX_load_verify_locations(ctx, ca_cert_path, nullptr) != 1)
+    error("Failed to load CA certificate for verification");
+
+  SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, nullptr);
 
   sockaddr_in serv_addr;
   SocketRAII sock = setup_client_socket(host, port, serv_addr);
@@ -198,6 +213,8 @@ void run_tcp_client(const char *host, int port) {
     error("SSL_new failed");
   SSL_set_fd(ssl, sock);
 
+  SSL_set_tlsext_host_name(ssl, host);
+
   if (SSL_connect(ssl) <= 0) {
     error("SSL_connect failed");
   }
@@ -209,13 +226,13 @@ void run_tcp_client(const char *host, int port) {
   while (true) {
     std::cout << "Client> ";
     std::string message;
-    if (!std::getline(std::cin, message))
-      break;
-    message += "\n";
-    if (SSL_write(ssl, message.c_str(), message.length()) <= 0) {
-      ERR_print_errors_fp(stderr);
+    if (!std::getline(std::cin, message)) {
+      std::cout << "\nSending graceful shutdown..." << std::endl;
       break;
     }
+    message += "\n";
+    if (SSL_write(ssl, message.c_str(), message.length()) <= 0)
+      break;
 
     ssize_t bytes = SSL_read(ssl, buffer, sizeof(buffer) - 1);
     if (bytes <= 0) {
@@ -223,8 +240,7 @@ void run_tcp_client(const char *host, int port) {
       if (err == SSL_ERROR_ZERO_RETURN) {
         std::cout << "Server disconnected gracefully.\n";
       } else {
-        std::cout << "SSL_read failed. Error: " << err << std::endl;
-        ERR_print_errors_fp(stderr);
+        std::cout << "Connection lost.\n";
       }
       break;
     }
@@ -233,11 +249,11 @@ void run_tcp_client(const char *host, int port) {
   }
 }
 
-void usage(const char *program_name) {
+void usage(const char *prog) {
   std::cerr << "Usage:\n"
-            << "  server: " << program_name
-            << " server <port> <cert_file> <key_file>\n"
-            << "  client: " << program_name << " client <host> <port>\n";
+            << "  Generate keys: ./gen_keys.sh\n"
+            << "  Server: " << prog << " server <port> <cert_file> <key_file>\n"
+            << "  Client: " << prog << " client <host> <port> <ca_cert_file>\n";
   exit(EXIT_FAILURE);
 }
 
@@ -262,16 +278,11 @@ int main(int argc, char const *argv[]) {
   if (mode == "server") {
     if (argc != 5)
       usage(argv[0]);
-    int port = std::atoi(argv[2]);
-    const char *cert_file = argv[3];
-    const char *key_file = argv[4];
-    run_tcp_server(port, cert_file, key_file);
+    run_tcp_server(std::atoi(argv[2]), argv[3], argv[4]);
   } else if (mode == "client") {
-    if (argc != 4)
+    if (argc != 5)
       usage(argv[0]);
-    const char *host = argv[2];
-    int port = std::atoi(argv[3]);
-    run_tcp_client(host, port);
+    run_tcp_client(argv[2], std::atoi(argv[3]), argv[4]);
   } else {
     usage(argv[0]);
   }
